@@ -22,7 +22,13 @@ typedef struct metadata_t {
   size_t size;
   struct metadata_t *next;
   struct metadata_t *prev;
+  // a footer points to the metadata?
 } metadata_t;
+
+typedef struct  footer_t{
+  size_t size;
+}footer_t;
+
 
 typedef struct bin_t {
   metadata_t dummy_head;
@@ -53,15 +59,50 @@ int get_bin_index(size_t size) {
   return 9; // bin 9: 2048-4096 bytes (and above)
 }
 
-void my_add_to_free_list(metadata_t *metadata) {
-  assert(!metadata->next && !metadata->prev);
-  int bin_idx = get_bin_index(metadata->size);
-  bin_t *bin = &my_heap.bins[bin_idx];
-  metadata->next = bin->dummy_head.next; //the next is a pointer
-  metadata->prev = &bin->dummy_head; // the dummy_head is an actuall value, so need &
-  bin->dummy_head.next->prev = metadata;
-  bin->dummy_head.next = metadata;
+
+void set_footer(metadata_t *metadata){
+  // note: when calling set_footer, the metadata's size should NOT contain the footer's size
+  // in other words, we need to subtract footer size from metadata's size before calling set_footer
+  // find where to insert footer (metadata|object or free memory|footer|another metadata)
+  footer_t *footer = (footer_t *)((char *)metadata + sizeof(metadata_t) + metadata->size);
+  footer->size = metadata->size;
 }
+
+// get current metadata's left neighbor from footer
+// return it's left neighbor if it's free, else NULL
+// what type should i return?
+metadata_t *get_left_neighbor(metadata_t *metadata){
+// move to left by footer size -> find where it's metadata is ->check if it is in free bins
+  footer_t *left_neighbor_foolter=(footer_t *)((char *)metadata - sizeof(footer_t));
+  metadata_t *left_neighbor = (metadata_t *)((char *)metadata - sizeof(footer_t) - left_neighbor_foolter->size - sizeof(metadata_t));
+  if (left_neighbor->next && left_neighbor->prev){//check if it's in free bins DLL
+    return left_neighbor;
+  }
+  return NULL;
+}
+
+metadata_t *get_right_neighbor(metadata_t *metadata){
+  // move pointer (current)metadata|size|footer|(go_to_here)right_metadata|
+  metadata_t *right_neighbor = (metadata_t *)((char *)metadata + sizeof(metadata_t) + metadata->size + sizeof(footer_t));
+  if (right_neighbor->next && right_neighbor->prev){//check if it's in free bins DLL
+    return right_neighbor;
+  }
+  return NULL;
+}
+metadata_t *merge_left(metadata_t *metadata, metadata_t *left){
+  // new size: original left's free size + metadata's free size + original left footer size + metadata header's size
+  // not contain origin metadata's footer size 
+  size_t new_size = left->size + sizeof(footer_t) + sizeof(metadata_t) + metadata->size;
+  left->size = new_size;
+  return left;
+}
+
+metadata_t *merge_right(metadata_t *metadata, metadata_t *right){
+  size_t new_size = metadata->size + sizeof(footer_t) + sizeof(metadata_t) + right->size;
+  metadata->size = new_size;
+  return metadata;
+}
+
 
 void my_remove_from_free_list(metadata_t *metadata) {
   // reconnect DLL
@@ -70,6 +111,41 @@ void my_remove_from_free_list(metadata_t *metadata) {
   //ensure we don't creat a circle when latter put it back
   metadata->next = NULL;
   metadata->prev = NULL;
+}
+
+
+metadata_t *check_and_merge(metadata_t *metadata){
+  // no need to remove new income metadata from free list because we do this before adding
+  //the wrapper function to perform left/right/both side merge before adding to free list
+  metadata_t *left = get_left_neighbor(metadata);
+  metadata_t *right = get_right_neighbor(metadata);
+  if (left){
+    my_remove_from_free_list(left);//remove origin left
+    metadata = merge_left(metadata, left);//current metadata is pointing to original left
+  }
+  if (right){
+    my_remove_from_free_list(right);//remove origin right
+    metadata = merge_right(metadata, right);
+  }
+  return metadata;
+}
+
+
+void my_add_to_free_list(metadata_t *metadata) {
+  assert(!metadata->next && !metadata->prev);
+  // check if anything to merge, update metadata points to the merged address
+  metadata_t *merged_metadata = check_and_merge(metadata);
+  set_footer(merged_metadata);//add a new footer at the end of merged free memory
+
+  //put into corresponding bin:
+  int bin_idx = get_bin_index(merged_metadata->size);
+  bin_t *bin = &my_heap.bins[bin_idx];
+
+  // reconnect DLL
+  merged_metadata->next = bin->dummy_head.next; //the next is merged_metadata pointer
+  merged_metadata->prev = &bin->dummy_head; // the dummy_head is an actuall value, so need &
+  bin->dummy_head.next->prev = merged_metadata;
+  bin->dummy_head.next = merged_metadata;
 }
 
 
@@ -124,45 +200,46 @@ void *my_malloc(size_t size) {
     if (!best_slot){// if no more memory in mmap, return null
       return NULL;
     }
-    best_slot->size = buffer_size - sizeof(metadata_t);
+    best_slot->size = buffer_size - sizeof(metadata_t) - sizeof(footer_t);
     best_slot->next = NULL;
     best_slot->prev = NULL;
     // continue to use the new got metadata
   }
-  // get the new available slot either from bins or mmap
-  //  ptr: point to right after the metadata itself
-  void *ptr = best_slot + 1;
-  size_t remaining_size = best_slot->size - size;
+
+  //set footer to the newly allocated memory(which may contains greater than required size
+  //if remaining is smaller than metadata size )
+  set_footer(best_slot);
   // Remove the best_slot from the free list if it's original in bins
   if (best_slot->next && best_slot->prev){
     my_remove_from_free_list(best_slot);
   }
-  if (remaining_size > sizeof(metadata_t)) { //add remaining back to free list conditionally
-    // Shrink the metadata for the allocated object
-    // to separate the rest of the region corresponding to remaining_size.
-    // If the remaining_size is not large enough to make a new metadata,
-    // this code path will not be taken and the region will be managed
-    // as a part of the allocated object.
+
+  //  ptr: point to right after the metadata itself
+  void *ptr = best_slot + 1;
+  size_t remaining_size = best_slot->size - size ;
+  if (remaining_size > sizeof(metadata_t) + sizeof(footer_t)) { //add remaining back to free list conditionally
+    // If the remaining is smaller than sizeof metadata, the remaining will be taken as a part of the allocated object.
     best_slot->size = size; // currently the best_slot represents an allocated space, so it's size is required size
+    set_footer(best_slot);//reset footer if we shrink the best_slot's size
     // Create a new metadata for the remaining free slot that comes after allocated object
-    metadata_t *new_metadata = (metadata_t *)((char *)ptr + size);//add start of required by the required object size
+    metadata_t *new_metadata = (metadata_t *)((char *)best_slot + sizeof(metadata_t) + best_slot->size + sizeof(footer_t));//add start of required by the required object size
     // cast to metadata_t since we put new free slot metadata here
-    new_metadata->size = remaining_size - sizeof(metadata_t);
+    new_metadata->size = remaining_size - sizeof(metadata_t) - sizeof(footer_t);
     new_metadata->next = NULL;
+    new_metadata->prev = NULL;
     // Add the remaining free slot to the free list.
+    set_footer(new_metadata);
     my_add_to_free_list(new_metadata);
-  }
+  } 
   return ptr;//return start address of required
 }
 
 
 // furthur: check if the whole 4096 is empty and call munmap_to_system.
 void my_free(void *ptr) {
-  // Look up the metadata. The metadata is placed just prior to the object.
   //the size remains unchanged as the size it gives the obj
-  // ... | metadata | object | ...
-  //     ^          ^
-  //     metadata   ptr
+  // Look up the metadata. The metadata is placed just prior to the object.
+  //since the ptr points to the start of object, move it back by one metadata size
   metadata_t *metadata = (metadata_t *)ptr - 1;
   // Add the free slot to the free list.
   my_add_to_free_list(metadata);
