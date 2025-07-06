@@ -15,6 +15,7 @@ void munmap_to_system(void *ptr, size_t size);
 
 //10 bins for 2's power of size
 #define BIN_NUMBER 10
+#define BUFFER_SIZE 4096
 
 // Struct definitions
 
@@ -25,10 +26,15 @@ typedef struct metadata_t {
   // a footer points to the metadata?
 } metadata_t;
 
-typedef struct  footer_t{
+typedef struct footer_t{
   size_t size;
 }footer_t;
 
+typedef struct page_info_t{
+  void *start_addr;
+  struct page_info_t *next;
+  struct page_info_t *prev;
+}page_info_t;
 
 typedef struct bin_t {
   metadata_t dummy_head;
@@ -38,6 +44,8 @@ typedef struct bin_t {
 typedef struct heap_t {
   // an array of bins
   bin_t bins[BIN_NUMBER];
+  // the start of pages
+  page_info_t *page_head;
 } heap_t;
 
 // Static variables (DO NOT ADD ANOTHER STATIC VARIABLES!)
@@ -68,14 +76,43 @@ void set_footer(metadata_t *metadata){
   footer->size = metadata->size;
 }
 
+// given an address, traverse all page DLL and find which page it belongs to
+page_info_t *find_page(void *addr){
+  page_info_t *page = my_heap.page_head;
+  while (page){
+    if(addr >= page->start_addr && addr < (void *)((char *)page->start_addr + BUFFER_SIZE)){
+      //if addr is in the middle of page region(start, start + 4096)
+      return page;
+    }
+    page = page->next;
+  }
+  return NULL;//pointer out of mmaped area
+}
+
+
+
 // get current metadata's left neighbor from footer
 // return it's left neighbor if it's free, else NULL
 // what type should i return?
 metadata_t *get_left_neighbor(metadata_t *metadata){
-// move to left by footer size -> find where it's metadata is ->check if it is in free bins
-  footer_t *left_neighbor_foolter=(footer_t *)((char *)metadata - sizeof(footer_t));
-  metadata_t *left_neighbor = (metadata_t *)((char *)metadata - sizeof(footer_t) - left_neighbor_foolter->size - sizeof(metadata_t));
-  if (left_neighbor->next && left_neighbor->prev){//check if it's in free bins DLL
+  //check page and metadatas' range
+  page_info_t *page = find_page(metadata);
+  if(!page){return NULL;}//out of mmaped range
+  // if it's the first metadata in page, there's no left
+  if (((char *)page->start_addr + sizeof(page_info_t)) == (void *)metadata){
+    return NULL;
+  }
+  // move to left by footer size -> find where it's metadata is -> check if it is in free bins
+  void *left_neighbor_footer_addr = (char *)metadata - sizeof(footer_t);
+  //first check footer range
+  if (left_neighbor_footer_addr < page->start_addr){
+    return NULL;//footer belongs to another page
+  }
+  footer_t *left_neighbor_footer = (footer_t *)left_neighbor_footer_addr;//cast to footer type
+  if (!left_neighbor_footer){return NULL;}//if cannot find footer
+  //then get left metadata address
+  metadata_t *left_neighbor = (metadata_t *)((char *)metadata - sizeof(footer_t) - left_neighbor_footer->size - sizeof(metadata_t));
+  if (left_neighbor && left_neighbor->next && left_neighbor->prev){//check if it's in free bins DLL
     return left_neighbor;
   }
   return NULL;
@@ -83,12 +120,24 @@ metadata_t *get_left_neighbor(metadata_t *metadata){
 
 metadata_t *get_right_neighbor(metadata_t *metadata){
   // move pointer (current)metadata|size|footer|(go_to_here)right_metadata|
-  metadata_t *right_neighbor = (metadata_t *)((char *)metadata + sizeof(metadata_t) + metadata->size + sizeof(footer_t));
-  if (right_neighbor->next && right_neighbor->prev){//check if it's in free bins DLL
+  page_info_t *page = find_page(metadata);
+  if(!page){return NULL;}//out of mmaped range
+  void *page_end = (char *)page->start_addr + BUFFER_SIZE;
+  // first check right metadata
+  void *right_neighbor_addr = (char *)metadata + sizeof(metadata_t) + metadata->size + sizeof(footer_t);
+  if (right_neighbor_addr + sizeof(metadata_t) > page_end){
+    return NULL;//right metadata out of range
+  }
+  metadata_t *right_neighbor = (metadata_t *)(right_neighbor_addr);//cast to metadata type
+  if (right_neighbor && right_neighbor->next && right_neighbor->prev){
+    //check if metadata exists(not NULL) and it's in free bins DLL
+    //if metadata exists, we can say footer also in same page because we check at adding time
     return right_neighbor;
   }
   return NULL;
 }
+
+
 metadata_t *merge_left(metadata_t *metadata, metadata_t *left){
   // new size: original left's free size + metadata's free size + original left footer size + metadata header's size
   // not contain origin metadata's footer size 
@@ -148,6 +197,19 @@ void my_add_to_free_list(metadata_t *metadata) {
   bin->dummy_head.next = merged_metadata;
 }
 
+//pages helper, add a new page to pages' head by it's start address
+void add_to_page_list(page_info_t *page_start){
+  //claim the page start address to contain page_info
+  page_info_t *page_info = (page_info_t *)page_start;
+  page_info->start_addr = page_start;
+  //add new page to head of connect pages DLL, 
+  page_info->next = my_heap.page_head;
+  page_info->prev = NULL;
+  if(my_heap.page_head!=NULL){
+    my_heap.page_head->prev=page_info;
+  }
+  my_heap.page_head = page_info;
+}
 
 // Interfaces of malloc (DO NOT RENAME FOLLOWING FUNCTIONS!)
 
@@ -161,6 +223,7 @@ void my_initialize() {
     my_heap.bins[i].dummy_tail.next = NULL;
     my_heap.bins[i].dummy_head.prev = NULL;
   }
+  my_heap.page_head = NULL;
 }
 
 // my_malloc() is called every time an object is allocated.
@@ -193,21 +256,21 @@ void *my_malloc(size_t size) {
 
   if (!best_slot) {
     // cannot find free slot available in all bins, means we're going to use the new memory immediatly
-    // request a new memory region from the system by calling mmap_from_system().
-    // buffer_size: metadata + free_slot
-    size_t buffer_size = 4096;
-    best_slot = (metadata_t *)mmap_from_system(buffer_size); //request a new block of 4096 
-    if (!best_slot){// if no more memory in mmap, return null
+    // request a new page region from the system by calling mmap_from_system().
+    void *page_start = mmap_from_system(BUFFER_SIZE);
+    if (!page_start){// if no more memory in mmap, return null(failed to mmap)
       return NULL;
     }
-    best_slot->size = buffer_size - sizeof(metadata_t) - sizeof(footer_t);
+    add_to_page_list(page_start);
+
+    best_slot = (metadata_t *)((char *)page_start + sizeof(page_info_t));
+    best_slot->size = BUFFER_SIZE - sizeof(page_info_t) - sizeof(metadata_t) - sizeof(footer_t);
     best_slot->next = NULL;
     best_slot->prev = NULL;
     // continue to use the new got metadata
   }
-
-  //set footer to the newly allocated memory(which may contains greater than required size
-  //if remaining is smaller than metadata size )
+  //set footer to the newly allocated memory
+  //(may be greater than required size if remain is smaller than metadata+footer )
   set_footer(best_slot);
   // Remove the best_slot from the free list if it's original in bins
   if (best_slot->next && best_slot->prev){
@@ -219,8 +282,10 @@ void *my_malloc(size_t size) {
   size_t remaining_size = best_slot->size - size ;
   if (remaining_size > sizeof(metadata_t) + sizeof(footer_t)) { //add remaining back to free list conditionally
     // If the remaining is smaller than sizeof metadata, the remaining will be taken as a part of the allocated object.
-    best_slot->size = size; // currently the best_slot represents an allocated space, so it's size is required size
-    set_footer(best_slot);//reset footer if we shrink the best_slot's size
+    // currently the best_slot represents an allocated space, so it's size is required size
+    best_slot->size = size; 
+    //reset footer if we shrink the best_slot's size
+    set_footer(best_slot);
     // Create a new metadata for the remaining free slot that comes after allocated object
     metadata_t *new_metadata = (metadata_t *)((char *)best_slot + sizeof(metadata_t) + best_slot->size + sizeof(footer_t));//add start of required by the required object size
     // cast to metadata_t since we put new free slot metadata here
