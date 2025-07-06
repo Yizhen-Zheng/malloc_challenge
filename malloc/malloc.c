@@ -54,7 +54,7 @@ int get_bin_index(size_t size) {
 }
 
 void my_add_to_free_list(metadata_t *metadata) {
-  assert(!metadata->next);
+  assert(!metadata->next && !metadata->prev);
   int bin_idx = get_bin_index(metadata->size);
   bin_t *bin = &my_heap.bins[bin_idx];
   metadata->next = bin->dummy_head.next; //the next is a pointer
@@ -64,7 +64,7 @@ void my_add_to_free_list(metadata_t *metadata) {
 }
 
 void my_remove_from_free_list(metadata_t *metadata) {
-  // reconnect
+  // reconnect DLL
   metadata->prev->next = metadata->next;
   metadata->next->prev = metadata->prev;
   //ensure we don't creat a circle when latter put it back
@@ -93,63 +93,66 @@ void my_initialize() {
 // mmap_from_system() / munmap_to_system().
 void *my_malloc(size_t size) {
   int bin_idx=get_bin_index(size);
-  metadata_t *metadata = my_heap.bins[bin_idx].dummy_head.next;
   metadata_t *best_slot=NULL; // a pointer variable to keep watch the current best fit
-
-  while (metadata != &my_heap.bins[bin_idx].dummy_tail ) {
-    if (metadata->size >= size){
-      if (!best_slot || best_slot->size > metadata->size){ 
-        // update best_slot if found a fitter metadata
-        best_slot=metadata;
+  // a for loop check all bins above required size 
+  for (int i = bin_idx; i < BIN_NUMBER; i++){
+    metadata_t *metadata = my_heap.bins[i].dummy_head.next;
+    while (metadata != &my_heap.bins[i].dummy_tail ) {
+      if (metadata->size >= size){
+        if (!best_slot || best_slot->size > metadata->size){ 
+          // update best_slot if found a fitter metadata
+          best_slot=metadata;
+        }
+        if (best_slot->size==size){
+          break;//if it's a exactly fit slot, break immediately
+        }
       }
+      metadata = metadata->next;
     }
-    metadata = metadata->next;
+    if (best_slot){
+      break;// if find best_slot in current bin size, stop explore larger bins
+    }
   }
+
 
   if (!best_slot) {
-    // cannot find free slot available. request a new memory region from the system by calling mmap_from_system().
+    // cannot find free slot available in all bins, means we're going to use the new memory immediatly
+    // request a new memory region from the system by calling mmap_from_system().
     // buffer_size: metadata + free_slot
     size_t buffer_size = 4096;
-    metadata_t *new_metadata = (metadata_t *)mmap_from_system(buffer_size); //request a new block of 4096 
-    new_metadata->size = size;
-    new_metadata->next = NULL;
-    new_metadata->prev = NULL;
-
-    size_t new_remain_size = buffer_size - size;
-    if(new_remain_size > sizeof(metadata_t)){
-      void *end_of_new_metadata = new_metadata +1;
-      metadata_t *new_remain_of_new_metadata = (metadata_t *)((char *)end_of_new_metadata + size);
-      // add the remain of new requested space to corresponding free list
-      my_add_to_free_list(new_remain_of_new_metadata);
+    best_slot = (metadata_t *)mmap_from_system(buffer_size); //request a new block of 4096 
+    if (!best_slot){// if no more memory in mmap, return null
+      return NULL;
     }
-    // Add the memory region to the correct size of free list.
-    my_add_to_free_list(new_metadata);
-    // try my_malloc() again. 
-    return my_malloc(size);
+    best_slot->size = buffer_size - sizeof(metadata_t);
+    best_slot->next = NULL;
+    best_slot->prev = NULL;
+    // continue to use the new got metadata
   }
-  // found the new available slot
-  //  ptr: point to next after the metadata itself
+  // get the new available slot either from bins or mmap
+  //  ptr: point to right after the metadata itself
   void *ptr = best_slot + 1;
   size_t remaining_size = best_slot->size - size;
-  // Remove the free slot from the free list.
-  my_remove_from_free_list(best_slot);
-
-  if (remaining_size > sizeof(metadata_t)) {
+  // Remove the best_slot from the free list if it's original in bins
+  if (best_slot->next && best_slot->prev){
+    my_remove_from_free_list(best_slot);
+  }
+  if (remaining_size > sizeof(metadata_t)) { //add remaining back to free list conditionally
     // Shrink the metadata for the allocated object
     // to separate the rest of the region corresponding to remaining_size.
     // If the remaining_size is not large enough to make a new metadata,
     // this code path will not be taken and the region will be managed
     // as a part of the allocated object.
-    best_slot->size = size; // currently the best_slot represents an allocated space, so it's size is used size
+    best_slot->size = size; // currently the best_slot represents an allocated space, so it's size is required size
     // Create a new metadata for the remaining free slot that comes after allocated object
-    metadata_t *new_metadata = (metadata_t *)((char *)ptr + size);//pointer arithmetic, 
-    // cast to metadata_t cuz we put new free slot here
+    metadata_t *new_metadata = (metadata_t *)((char *)ptr + size);//add start of required by the required object size
+    // cast to metadata_t since we put new free slot metadata here
     new_metadata->size = remaining_size - sizeof(metadata_t);
     new_metadata->next = NULL;
     // Add the remaining free slot to the free list.
     my_add_to_free_list(new_metadata);
   }
-  return ptr;
+  return ptr;//return start address of required
 }
 
 
