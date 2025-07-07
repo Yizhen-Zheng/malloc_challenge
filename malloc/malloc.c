@@ -90,7 +90,6 @@ page_info_t *find_page(void *addr){
 }
 
 
-
 // get current metadata's left neighbor from footer
 // return it's left neighbor if it's free, else NULL
 // what type should i return?
@@ -123,7 +122,8 @@ metadata_t *get_right_neighbor(metadata_t *metadata){
   void *page_end = (char *)page->start_addr + BUFFER_SIZE;
   void *footer_end = (char *)metadata + sizeof(metadata_t) + metadata->size + sizeof(footer_t);
   // if it's the last metadata in page, there's no right
-  if (footer_end >= page_end - 1){return NULL;}
+  if (footer_end >= page_end ){return NULL;}
+
   // find right metadata
   metadata_t *right_neighbor = (metadata_t *)((char *)metadata + sizeof(metadata_t) + metadata->size + sizeof(footer_t));
   if ( right_neighbor->next && right_neighbor->prev){
@@ -176,6 +176,39 @@ metadata_t *check_and_merge(metadata_t *metadata){
   return metadata;
 }
 
+
+bool is_empty_page(page_info_t *page){
+  // find first metadata
+  void *first_metafata_addr = (char *)page->start_addr + sizeof(page_info_t);
+  metadata_t *metadata = (metadata_t *)first_metafata_addr;
+
+  void *page_end = (char *)page->start_addr + BUFFER_SIZE;
+  size_t empty_size = BUFFER_SIZE - sizeof(page_info_t) - sizeof(metadata_t) - sizeof(footer_t);
+  // check metadata size matches and it's free
+  if (metadata->size == empty_size && metadata->next!=NULL && metadata->prev!=NULL){
+    // double check footer
+    // footer_t *footer = (footer_t *)((char *)metadata + sizeof(metadata) + metadata->size);
+    // if((char *)footer + sizeof(footer_t) == (char *)page_end){
+    //   return true;
+    // }
+    return true;
+  }
+  return false;
+}
+
+void remove_page_from_list(page_info_t *page){
+  if (page->prev){
+    //if current page is not head, reconnect prev to next
+    page->prev->next = page->next;
+  }else{
+    //if current page is head, change head
+    my_heap.page_head = page->next;
+  }
+  if (page->next){
+    //if current page is not tail, reconnect next to prev
+    page->next->prev = page->prev;
+  }
+}
 
 void my_add_to_free_list(metadata_t *metadata) {
   assert(!metadata->next && !metadata->prev);
@@ -297,7 +330,6 @@ void *my_malloc(size_t size) {
 }
 
 
-// furthur: check if the whole 4096 is empty and call munmap_to_system.
 void my_free(void *ptr) {
   //the size remains unchanged as the size it gives the obj
   // Look up the metadata. The metadata is placed just prior to the object.
@@ -305,6 +337,21 @@ void my_free(void *ptr) {
   metadata_t *metadata = (metadata_t *)ptr - 1;
   // Add the free slot to the free list.
   my_add_to_free_list(metadata);
+
+  // check munmap merged data
+  // the ptr will remain on the same page whether or not it was merged
+  //(merge only happend within the same page)
+  page_info_t *page = find_page(ptr);
+  if(page && is_empty_page(page)){
+    //remove first metadata from free list
+    void *first_metadata_addr = (char *)page->start_addr + sizeof(page_info_t);
+    //find the first_metadata and remove from free list (not available)
+    metadata_t * first_metadata = (metadata_t *)first_metadata_addr;
+    my_remove_from_free_list(first_metadata);
+    remove_page_from_list(page);
+    // munmap the page
+    munmap_to_system(page->start_addr, BUFFER_SIZE);
+  }
 }
 
 // This is called at the end of each challenge.
