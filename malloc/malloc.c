@@ -98,21 +98,19 @@ metadata_t *get_left_neighbor(metadata_t *metadata){
   //check page and metadatas' range
   page_info_t *page = find_page(metadata);
   if(!page){return NULL;}//out of mmaped range
+
   // if it's the first metadata in page, there's no left
   if (((char *)page->start_addr + sizeof(page_info_t)) == (void *)metadata){
     return NULL;
   }
-  // move to left by footer size -> find where it's metadata is -> check if it is in free bins
-  void *left_neighbor_footer_addr = (char *)metadata - sizeof(footer_t);
-  //first check footer range
-  if (left_neighbor_footer_addr < page->start_addr){
-    return NULL;//footer belongs to another page
-  }
-  footer_t *left_neighbor_footer = (footer_t *)left_neighbor_footer_addr;//cast to footer type
-  if (!left_neighbor_footer){return NULL;}//if cannot find footer
-  //then get left metadata address
-  metadata_t *left_neighbor = (metadata_t *)((char *)metadata - sizeof(footer_t) - left_neighbor_footer->size - sizeof(metadata_t));
-  if (left_neighbor && left_neighbor->next && left_neighbor->prev){//check if it's in free bins DLL
+
+  footer_t *left_neighbor_footer = (footer_t *)((char *)metadata - sizeof(footer_t));//cast to footer type
+
+  // since we assume there's no space between page start and first metadata in page 
+  // so if we can find the footer, there must be a metadata. so no need check left metadata, 
+  // get left metadata address
+  metadata_t *left_neighbor = (metadata_t *)((char *)left_neighbor_footer - left_neighbor_footer->size - sizeof(metadata_t));
+  if (left_neighbor->next && left_neighbor->prev){//check if it's in free bins DLL
     return left_neighbor;
   }
   return NULL;
@@ -123,13 +121,12 @@ metadata_t *get_right_neighbor(metadata_t *metadata){
   page_info_t *page = find_page(metadata);
   if(!page){return NULL;}//out of mmaped range
   void *page_end = (char *)page->start_addr + BUFFER_SIZE;
-  // first check right metadata
-  void *right_neighbor_addr = (char *)metadata + sizeof(metadata_t) + metadata->size + sizeof(footer_t);
-  if (right_neighbor_addr + sizeof(metadata_t) > page_end){
-    return NULL;//right metadata out of range
-  }
-  metadata_t *right_neighbor = (metadata_t *)(right_neighbor_addr);//cast to metadata type
-  if (right_neighbor && right_neighbor->next && right_neighbor->prev){
+  void *footer_end = (char *)metadata + sizeof(metadata_t) + metadata->size + sizeof(footer_t);
+  // if it's the last metadata in page, there's no right
+  if (footer_end >= page_end - 1){return NULL;}
+  // find right metadata
+  metadata_t *right_neighbor = (metadata_t *)((char *)metadata + sizeof(metadata_t) + metadata->size + sizeof(footer_t));
+  if ( right_neighbor->next && right_neighbor->prev){
     //check if metadata exists(not NULL) and it's in free bins DLL
     //if metadata exists, we can say footer also in same page because we check at adding time
     return right_neighbor;

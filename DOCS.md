@@ -11,6 +11,32 @@
 - pay attention to memory layout consistency when adding footer(caused a bug)
 - make sure the way we add free slot is not adding cross-page slot
 
-[x]detect page edges
+##### page edge detect strategy:
+
+- when trying to get left, only check if current is at page start
+- when trying to get right, only check if current is at page end
+- when we require a new page, we create metadata right after the page start,
+  this ensures we won't create small pieces in left(the start after page_start)
+- when we require a new page and return the requested space, we immediately create a free metadata for the remainning spaces(if any),
+  this ensures every metadata(if not fill the page) will have at least one right neighbor
+- why: the mechanism that 'requested metadata will manage small spaces that not enough to split into another free slot',
+  this ensures we won't create small pieces in right(the end of page)
+
+so we currently don't need these additional check:
+
+```c
+  // check left footer range by moving to left by footer size
+  void *left_neighbor_footer_addr = (char *)metadata - sizeof(footer_t);
+  if (left_neighbor_footer_addr < page->start_addr){
+    return NULL;//footer belongs to another page
+  }
+
+  // check right metadata range
+  void *right_neighbor_addr = (char *)metadata + sizeof(metadata_t) + metadata->size + sizeof(footer_t);
+  if (right_neighbor_addr + sizeof(metadata_t) > page_end){
+    return NULL;//right metadata out of range
+  }
+```
+
 [x]detect and return unused pages, munmap them
 [x]handle malloc request greater than 4096
